@@ -17,6 +17,13 @@ crons = ["0 */4 * * *"]
 [vars]
 # METING_COOKIE_TENCENT = "YOUR_COOKIE_HERE"
 # METING_COOKIE_ALLOW_HOSTS = "example.com,*.example.com"
+# 企业微信机器人 Webhook（也可以部署后 POST /admin/webhook 写入 KV）
+# METING_ALERT_WEBHOOK = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"
+# 备用 Cookie，多个用 || 分隔（也可以 POST /admin/cookie/backup 动态添加）
+# METING_COOKIE_TENCENT_BACKUPS = "uin=...; qqmusic_key=...||uin=..."
+METING_ANONYMOUS_FALLBACK = "1"
+METING_FALLBACK_SERVERS = "netease"
+METING_FALLBACK_STRICT_ARTIST = "0"
 
 [observability]
 enabled = false

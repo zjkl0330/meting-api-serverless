@@ -1,3 +1,8 @@
+import { getActiveCookie as getStoredActiveCookie, getState } from './cookieStore.js'
+import { parseCookie, inspectTencentCookie, maskCookie, cookieFingerprint } from './cookieFormat.js'
+
+export { parseCookie, inspectTencentCookie, maskCookie, cookieFingerprint }
+
 /**
  * 从环境变量读取指定平台的 cookie。
  * 优先读取 METING_COOKIE_<SERVER>，其次 METING_COOKIE。
@@ -13,9 +18,9 @@ export function readCookie (server, env) {
  * 异步读取 Cookie，优先从 KV 读取 (仅限腾讯)，其次环境变量
  */
 export async function readCookieAsync (server, env) {
-  if (server === 'tencent' && env.METING_KV) {
-    const kvCookie = await env.METING_KV.get('cookie_tencent')
-    if (kvCookie) return kvCookie.trim()
+  if (server === 'tencent') {
+    const active = await getStoredActiveCookie(env)
+    if (active) return active
   }
   return readCookie(server, env)
 }
@@ -40,5 +45,46 @@ export function isAllowedHost (referrer, allowHosts = []) {
     })
   } catch (error) {
     return false
+  }
+}
+
+/**
+ * 统一解析本次请求应使用的 Cookie。
+ *
+ * 返回：
+ * - cookie: 实际注入的 Cookie（空字符串表示匿名）
+ * - source: primary / backup:xxx / anonymous / env / none / blocked
+ * - state: ok / degraded / anonymous / invalid / unconfigured / blocked
+ * - blockedByHost: 是否被 referrer 白名单拦截
+ */
+export async function resolveCookie (server, env, { allowed = true } = {}) {
+  if (!allowed) {
+    return { cookie: '', source: 'blocked', state: 'blocked', blockedByHost: true }
+  }
+
+  if (server !== 'tencent') {
+    const cookie = readCookie(server, env)
+    return { cookie, source: cookie ? 'env' : 'none', state: cookie ? 'ok' : 'unconfigured', blockedByHost: false }
+  }
+
+  const state = await getState(env)
+  const cookie = await getStoredActiveCookie(env)
+
+  if (state.status === 'anonymous') {
+    return { cookie: '', source: 'anonymous', state: 'anonymous', blockedByHost: false }
+  }
+  if (!cookie) {
+    return { cookie: '', source: 'none', state: 'unconfigured', blockedByHost: false }
+  }
+
+  const effectiveState = ['ok', 'degraded', 'invalid', 'unconfigured'].includes(state.status)
+    ? state.status
+    : 'ok'
+
+  return {
+    cookie,
+    source: state.activeSource || 'primary',
+    state: effectiveState === 'unconfigured' ? 'ok' : effectiveState,
+    blockedByHost: false
   }
 }

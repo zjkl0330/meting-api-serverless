@@ -1,47 +1,17 @@
-import Meting from '@meting/core'
-import aesjs from 'aes-js'
-import { createHash } from 'crypto'
 import hashjs from 'hash.js'
 import { HTTPException } from 'hono/http-exception'
 import { loadConfig } from '../config.js'
 import { format as lyricFormat } from '../utils/lyric.js'
-import { readCookieAsync, isAllowedHost } from '../utils/cookie.js'
+import { resolveCookie, isAllowedHost } from '../utils/cookie.js'
+import { recoverCookie } from '../utils/cookieGuard.js'
+import { findUrlFallback } from '../utils/fallback.js'
+import { createMeting } from '../utils/metingFactory.js'
 import { LRUCache } from 'lru-cache'
 
 const cache = new LRUCache({
   max: 1000,
   ttl: 1000 * 30
 })
-
-// Cloudflare Workers 禁用 AES-ECB，@meting/core 在网易云请求中用到了 aes-128-ecb。
-// 这里用纯 JS 实现的 AES-ECB 替换默认实现，避免 createCipheriv 报 iv 为 null。
-const patchNeteaseEapiEncrypt = (meting) => {
-  const provider = meting?.provider
-  if (!provider || provider.name !== 'netease') return
-
-  const proto = Object.getPrototypeOf(provider)
-  if (proto.__patchedEapi) return
-  proto.__patchedEapi = true
-
-  proto.eapiEncrypt = (req) => {
-    const bodyStr = JSON.stringify(req.body)
-    const path = req.url.replace(/https?:\/\/[^/]+/, '')
-    const signSeed = `nobody${path}use${bodyStr}md5forencrypt`
-    const sign = createHash('md5').update(signSeed).digest('hex')
-    const payload = `${path}-36cd479b6b5-${bodyStr}-36cd479b6b5-${sign}`
-
-    const key = Buffer.from('e82ckenh8dichen8', 'utf8')
-    const textBytes = Buffer.from(payload, 'utf8')
-    const padded = aesjs.padding.pkcs7.pad(textBytes)
-    const aesEcb = new aesjs.ModeOfOperation.ecb(key)
-    const encryptedBytes = aesEcb.encrypt(padded)
-    const encryptedHex = Buffer.from(encryptedBytes).toString('hex').toUpperCase()
-
-    req.url = req.url.replace('/api/', '/eapi/')
-    req.body = { params: encryptedHex }
-    return req
-  }
-}
 
 const METING_METHODS = {
   search: 'search',
@@ -52,6 +22,21 @@ const METING_METHODS = {
   lrc: 'lyric',
   url: 'url',
   pic: 'pic'
+}
+
+const invoke = async (meting, method, id) => {
+  let response
+  try {
+    response = await meting[method](id)
+  } catch (error) {
+    console.error('[api] 上游调用失败:', error)
+    throw new HTTPException(500, { message: '上游 API 调用失败' })
+  }
+  try {
+    return JSON.parse(response)
+  } catch (error) {
+    throw new HTTPException(500, { message: '上游 API 返回格式异常' })
+  }
 }
 
 export default async (c) => {
@@ -81,45 +66,73 @@ export default async (c) => {
     }
   }
 
-  // 4. 调用 API
-  const cacheKey = `${server}/${type}/${id}`
+  // 4. 解析本次请求的 Cookie（含失效降级状态）
+  const referrer = c.req.header('referer')
+  const cookieAllowed = isAllowedHost(referrer, config.meting.cookie.allowHosts)
+  const resolved = await resolveCookie(server, c.env, { allowed: cookieAllowed })
+
+  let cookieState = resolved.state
+  let cookieSource = resolved.source
+
+  // 5. 调用 API
+  // 缓存按「是否带 Cookie」分桶，避免匿名请求复用 VIP 直链
+  const cookieMode = resolved.cookie ? 'ck' : 'anon'
+  const cacheKey = `${server}/${type}/${id}/${cookieMode}`
   let data = cache.get(cacheKey)
+  let fallbackInfo = null
+
   if (data === undefined) {
     c.header('x-cache', 'miss')
-    const meting = new Meting(server)
-    patchNeteaseEapiEncrypt(meting)
-    meting.format(true)
+    data = await invoke(createMeting(server, resolved.cookie), METING_METHODS[type], id)
 
-    // 检查 referrer 并配置 cookie
-    const referrer = c.req.header('referer')
-    if (isAllowedHost(referrer, config.meting.cookie.allowHosts)) {
-      const cookie = await readCookieAsync(server, c.env)
-      if (cookie) {
-        meting.cookie(cookie)
+    // 5.1 腾讯直链为空：可能是 Cookie 失效，立即体检并按需切换备用/匿名
+    if (type === 'url' && !data?.url && server === 'tencent' && cookieAllowed) {
+      const recovery = await recoverCookie(c.env, { reason: 'url_empty' })
+      if (recovery?.status) {
+        cookieState = recovery.status
+        if (recovery.status === 'degraded') cookieSource = 'backup'
+        if (recovery.status === 'anonymous') cookieSource = 'anonymous'
+      }
+      if (recovery?.cookie && recovery.cookie !== resolved.cookie) {
+        try {
+          const retried = await invoke(createMeting(server, recovery.cookie), 'url', id)
+          if (retried?.url) {
+            data = retried
+            cookieSource = recovery.status === 'anonymous' ? 'anonymous' : 'backup'
+          }
+        } catch (error) {
+          // 换 Cookie 重试失败不阻断后续跨平台兜底
+          console.warn('[api] 切换 Cookie 重试失败:', error?.message)
+        }
       }
     }
 
-    const method = METING_METHODS[type]
-    let response
-    try {
-      response = await meting[method](id)
-    } catch (error) {
-      console.error(error)
-      throw new HTTPException(500, { message: '上游 API 调用失败' })
+    // 5.2 仍然拿不到直链：临时跨平台兜底，保证音乐能继续播
+    if (type === 'url' && !data?.url && server === 'tencent') {
+      const fallback = await findUrlFallback(server, id, c.env)
+      if (fallback) {
+        data = { url: fallback.url, size: 0, br: -1 }
+        fallbackInfo = fallback
+        c.header('x-fallback-source', fallback.sameServer ? `${fallback.target}-same` : fallback.target)
+        c.header('x-fallback-match', fallback.match)
+        console.warn('[api] 使用兜底:', JSON.stringify({ target: fallback.target, sameServer: Boolean(fallback.sameServer), matched: fallback.matched }))
+      }
     }
-    try {
-      data = JSON.parse(response)
-    } catch (error) {
-      throw new HTTPException(500, { message: '上游 API 返回格式异常' })
+
+    if (type === 'url') {
+      const ttl = data?.url ? (fallbackInfo ? 1000 * 60 : 1000 * 60 * 10) : 1000 * 60
+      cache.set(cacheKey, data, { ttl })
+    } else {
+      cache.set(cacheKey, data, { ttl: 1000 * 60 * 60 })
     }
-    cache.set(cacheKey, data, {
-      ttl: type === 'url' ? 1000 * 60 * 10 : 1000 * 60 * 60
-    })
   }
 
-  // 5. 组装结果
+  c.header('x-cookie-state', cookieState)
+  c.header('x-cookie-source', cookieSource)
+
+  // 6. 组装结果
   if (type === 'url') {
-    let url = data.url
+    let url = data?.url
     if (!url) {
       return c.body(null, 404)
     }
@@ -147,7 +160,7 @@ export default async (c) => {
   }
 
   if (type === 'pic') {
-    const url = data.url
+    const url = data?.url
     if (!url) {
       return c.body(null, 404)
     }

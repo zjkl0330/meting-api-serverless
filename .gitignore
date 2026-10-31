@@ -4,3 +4,7 @@ lx-music-api-server/
 .wrangler
 .vercel
 
+# 本地密钥（企业微信 webhook 等），不要提交
+.dev.vars
+.env
+.env.*

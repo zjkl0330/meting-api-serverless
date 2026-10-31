@@ -4,11 +4,30 @@ compatibility_date = "2025-11-21"
 workers_dev = true
 compatibility_flags = ["nodejs_compat"]
 
-# QQ音乐定时cookie刷新
+# QQ 音乐 Cookie 定时续期 + 失效自动切换/告警
+# 每 4 小时整点执行一次（原来的 "* */4 * * *" 会在每个 4 小时段内每分钟执行一次）
 [triggers]
-crons = ["* */4 * * *"]
+crons = ["0 */4 * * *"]
 
+# KV 存储：Dashboard → Bindings 绑定，变量名必须是 METING_KV
+# [[kv_namespaces]]
+# binding = "METING_KV"
+# id = "YOUR_KV_NAMESPACE_ID_HERE"
 
+[vars]
+# 企业微信机器人 Webhook。公开仓库不要直接写在这里，推荐：
+#   wrangler secret put METING_ALERT_WEBHOOK
+# 或部署后调用 POST /admin/webhook 写入 KV（推荐，改配置不用重新部署）
+# METING_ALERT_WEBHOOK = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"
+
+# 主 Cookie 失效且没有备用时，是否临时降级匿名继续播放免费曲目（默认 1=开启）
+METING_ANONYMOUS_FALLBACK = "1"
+
+# 直链兜底平台（默认 netease；留空字符串即关闭跨平台兜底）
+METING_FALLBACK_SERVERS = "netease"
+
+# 兜底是否必须歌手也匹配（1=严格，可能因找不到原唱而不兜底；0=优先匹配原唱，找不到时允许同名翻唱）
+METING_FALLBACK_STRICT_ARTIST = "0"
 
 [observability]
 enabled = false

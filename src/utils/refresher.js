@@ -1,33 +1,32 @@
 import { createHash } from 'node:crypto'
+import { parseCookie } from './cookieFormat.js'
+import { getPrimaryCookie, savePrimaryCookie } from './cookieStore.js'
 
-export async function refreshQQCookie (env) {
-  const result = { success: false, message: '未执行刷新', data: null }
+const REFRESH_TIMEOUT_MS = 8000
 
-  let currentCookie = ''
-  // 0. 检查 KV 是否绑定
-  if (!env.METING_KV) {
-    result.message = '错误: 未绑定 METING_KV。请在 Dashboard 绑定 KV Namespace。'
-    console.warn(result.message)
-    return result
-  }
-  else {
-    currentCookie = await env.METING_KV.get('cookie_tencent')
-  }
+const fail = (message, extra = {}) => ({
+  success: false,
+  ok: false,
+  invalid: false,
+  code: null,
+  message,
+  ...extra
+})
 
-  // 1. 获取当前 Cookie
-
+/**
+ * 用指定 Cookie 调用 QQ 音乐 LoginServer 续期。
+ *
+ * 返回结构：
+ * - ok: true              续期成功
+ * - invalid: true         Cookie 确定失效（上游明确返回错误码/缺关键字段）
+ * - 两者都 false           网络/上游异常，状态未知，不能据此判定失效
+ */
+export async function refreshTencentCookie (env, cookie) {
+  const currentCookie = String(cookie || '').trim()
   if (!currentCookie) {
-    currentCookie = env.METING_COOKIE_TENCENT || env.METING_COOKIE || ''
-  }
-  
-
-  if (!currentCookie) {
-    result.message = '错误: 未找到 QQ 音乐 Cookie'
-    console.log(result.message)
-    return result
+    return fail('未找到 QQ 音乐 Cookie', { invalid: true, code: 'no_cookie' })
   }
 
-  // 2. 解析 Cookie
   const cookieDict = parseCookie(currentCookie)
   const refreshToken = cookieDict.psrf_qqrefresh_token
   const openid = cookieDict.psrf_qqopenid
@@ -36,19 +35,17 @@ export async function refreshQQCookie (env) {
   const musicKey = cookieDict.qqmusic_key || cookieDict.qm_keyst || ''
   const accessToken = cookieDict.psrf_qqaccess_token || ''
   const refreshKey = cookieDict.psrf_qqrefresh_key || ''
-  
-  // 尝试从 Cookie 中提取 QIMEI
+
   const qimei36 = cookieDict._qimei_q36 || ''
   const qimei16 = cookieDict._qimei_q16 || (qimei36 ? qimei36.substring(0, 16) : '')
 
   if (!refreshToken || !openid) {
-    result.message = '错误: Cookie 缺少关键字段 (psrf_qqrefresh_token/psrf_qqopenid)'
-    console.log(result.message)
-    return result
+    return fail('Cookie 缺少关键字段 (psrf_qqrefresh_token/psrf_qqopenid)，无法自动续期', {
+      invalid: true,
+      code: 'missing_fields'
+    })
   }
 
-  // 3. 构造请求参数
-  // 注意：如果 refreshKey 为空，仍需传递空字符串，否则可能导致签名校验失败或参数错误
   const comm = buildComm(strMusicId, musicKey, qimei16, qimei36)
   const reqData = {
     comm,
@@ -71,93 +68,103 @@ export async function refreshQQCookie (env) {
   const bodyStr = JSON.stringify(reqData)
   const sign = signBody(bodyStr)
 
-  // 4. 请求刷新接口
+  let response
   try {
-    const response = await fetch(`https://u.y.qq.com/cgi-bin/musics.fcg?sign=${sign}`, {
+    response = await fetch(`https://u.y.qq.com/cgi-bin/musics.fcg?sign=${sign}`, {
       method: 'POST',
       headers: {
         'User-Agent': 'Android12-AndroidPhone-20349-201-0-ting#958959317/661004247-LOGIN-wifi',
         'Content-Type': 'application/json'
       },
-      body: bodyStr
+      body: bodyStr,
+      signal: typeof AbortSignal !== 'undefined' && AbortSignal.timeout
+        ? AbortSignal.timeout(REFRESH_TIMEOUT_MS)
+        : undefined
     })
-
-    const data = await response.json()
-    // result.data = data // 避免返回敏感数据
-
-    // 检查响应
-    if (data.req?.code !== 0) {
-      result.message = `刷新失败 (Code: ${data.req?.code || 'Unknown'}): 这通常意味着 Cookie 已完全失效、签名错误或缺少 refresh_key。原始响应: ${JSON.stringify(data)}`
-      console.error(result.message)
-      return result
-    }
-
-    const loginData = data.req.data
-    const newCookies = {}
-
-    // 提取新字段
-    if (loginData.musickey) {
-      newCookies.qm_keyst = loginData.musickey
-      newCookies.qqmusic_key = loginData.musickey
-    }
-    if (loginData.qqmusic_key) newCookies.qqmusic_key = loginData.qqmusic_key
-    if (loginData.refresh_token) newCookies.psrf_qqrefresh_token = loginData.refresh_token
-    if (loginData.access_token) newCookies.psrf_qqaccess_token = loginData.access_token
-    if (loginData.openid) newCookies.psrf_qqopenid = loginData.openid
-    if (loginData.refresh_key) newCookies.psrf_qqrefresh_key = loginData.refresh_key
-
-    // 合并旧 Cookie
-    const updatedCookieDict = { ...cookieDict, ...newCookies }
-    const updatedCookieStr = Object.entries(updatedCookieDict)
-      .map(([k, v]) => `${k}=${v}`)
-      .join('; ')
-
-    // 5. 保存到 KV
-    if (updatedCookieStr !== currentCookie) {
-      await env.METING_KV.put('cookie_tencent', updatedCookieStr)
-      result.success = true
-      result.message = 'QQ 音乐 Cookie 刷新成功并已保存到 KV'
-      console.log(result.message)
-    } else {
-      result.success = true
-      result.message = 'Cookie 未发生变化'
-      console.log(result.message)
-    }
-  } catch (e) {
-    result.message = `系统错误: ${e.message}`
-    console.error('刷新过程出错:', e)
+  } catch (error) {
+    // 网络异常不代表 Cookie 失效
+    console.warn('[refresher] 续期请求异常:', error?.message)
+    return fail(`续期请求异常: ${error?.message}`)
   }
 
+  if (!response.ok) {
+    return fail(`续期接口返回 HTTP ${response.status}`)
+  }
+
+  let data
+  try {
+    data = await response.json()
+  } catch (error) {
+    return fail('续期接口返回非 JSON 数据')
+  }
+
+  const code = data?.req?.code
+  if (code !== 0) {
+    return {
+      success: false,
+      ok: false,
+      invalid: true,
+      code: code ?? 'unknown',
+      message: `刷新失败 (Code: ${code ?? 'Unknown'})，Cookie 可能已失效`,
+      detail: JSON.stringify(data).slice(0, 500)
+    }
+  }
+
+  const loginData = data.req.data || {}
+  const newCookies = {}
+
+  if (loginData.musickey) {
+    newCookies.qm_keyst = loginData.musickey
+    newCookies.qqmusic_key = loginData.musickey
+  }
+  if (loginData.qqmusic_key) newCookies.qqmusic_key = loginData.qqmusic_key
+  if (loginData.refresh_token) newCookies.psrf_qqrefresh_token = loginData.refresh_token
+  if (loginData.access_token) newCookies.psrf_qqaccess_token = loginData.access_token
+  if (loginData.openid) newCookies.psrf_qqopenid = loginData.openid
+  if (loginData.refresh_key) newCookies.psrf_qqrefresh_key = loginData.refresh_key
+
+  const updatedCookieDict = { ...cookieDict, ...newCookies }
+  const updatedCookieStr = Object.entries(updatedCookieDict)
+    .map(([k, v]) => `${k}=${v}`)
+    .join('; ')
+
+  return {
+    success: true,
+    ok: true,
+    invalid: false,
+    code: 0,
+    changed: updatedCookieStr !== currentCookie,
+    cookie: updatedCookieStr,
+    message: updatedCookieStr !== currentCookie ? 'QQ 音乐 Cookie 刷新成功' : 'Cookie 未发生变化'
+  }
+}
+
+/**
+ * 从存储里取出主 Cookie 并续期，成功时写回 primary（是否切为生效 Cookie 交给 guard 决定）
+ */
+export async function refreshQQCookie (env) {
+  const cookie = await getPrimaryCookie(env)
+  if (!cookie) {
+    return fail('未找到 QQ 音乐 Cookie', { invalid: true, code: 'no_cookie' })
+  }
+
+  const result = await refreshTencentCookie(env, cookie)
+  if (result.ok) {
+    await savePrimaryCookie(env, result.cookie, { activate: false })
+  }
   return result
 }
-
-function parseCookie (str) {
-  const dict = {}
-  if (!str) return dict
-  str.split(';').forEach(part => {
-    const i = part.indexOf('=')
-    if (i !== -1) {
-      const key = part.substring(0, i).trim()
-      const val = part.substring(i + 1).trim()
-      dict[key] = val
-    }
-  })
-  return dict
-}
-
-// --- 签名算法 (使用 node:crypto) ---
 
 function signBody (payload) {
   const PART_1_INDEXES = [23, 14, 6, 36, 16, 40, 7, 19].filter(x => x < 40)
   const PART_2_INDEXES = [16, 1, 32, 12, 19, 27, 8, 5]
   const SCRAMBLE_VALUES = [89, 39, 179, 150, 218, 82, 58, 252, 177, 52, 186, 123, 120, 64, 242, 133, 143, 161, 121, 179]
 
-  // 使用 node:crypto 进行 SHA1 计算，确保准确性
   const hash = createHash('sha1').update(payload, 'utf8').digest('hex').toUpperCase()
 
   const part1 = PART_1_INDEXES.map(i => hash[i]).join('')
   const part2 = PART_2_INDEXES.map(i => hash[i]).join('')
-  
+
   const part3 = new Uint8Array(20)
   for (let i = 0; i < SCRAMBLE_VALUES.length; i++) {
     const v = SCRAMBLE_VALUES[i]
@@ -165,7 +172,6 @@ function signBody (payload) {
     part3[i] = v ^ hexVal
   }
 
-  // Base64 编码
   let binary = ''
   for (let i = 0; i < part3.length; i++) {
     binary += String.fromCharCode(part3[i])
@@ -183,7 +189,6 @@ function buildComm (uin, token, qimei16, qimei36) {
     return res
   }
 
-  // 优先使用 Cookie 中的 QIMEI，否则随机
   const QIMEI = qimei16 || randomHex(16)
   const QIMEI36 = qimei36 || randomHex(36)
 
@@ -192,7 +197,7 @@ function buildComm (uin, token, qimei16, qimei36) {
     ct: 11,
     cv: 14090008,
     chid: '2005000982',
-    QIMEI, 
+    QIMEI,
     QIMEI36,
     tmeAppID: 'qqmusic',
     format: 'json',

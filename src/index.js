@@ -1,6 +1,6 @@
 import { createApp } from './app.js'
 import { stripPrefix } from './utils/prefix.js'
-import { refreshQQCookie } from './utils/refresher.js'
+import { maintainCookie } from './utils/cookieGuard.js'
 
 const app = createApp()
 
@@ -10,6 +10,7 @@ export default {
     return app.fetch(normalizedRequest, env, ctx)
   },
   async scheduled (event, env, ctx) {
-    ctx.waitUntil(refreshQQCookie(env))
+    // 续期 + 失效自动切换备用/匿名 + 企业微信提醒
+    ctx.waitUntil(maintainCookie(env, { trigger: 'cron' }))
   }
 }
