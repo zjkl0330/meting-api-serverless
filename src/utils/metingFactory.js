@@ -125,11 +125,177 @@ const patchTencentSearch = (meting) => {
   })
 }
 
+/**
+ * @meting/core 的腾讯 url() 依赖旧接口 c.y.qq.com/v8/fcg-bin/fcg_play_single_song.fcg，
+ * 而同一个 c.y.qq.com 域下的搜索接口已经整片 500 下线。这里改用官方客户端接口：
+ *   music.pf_song_detail_svr  取 media_mid / 各码率文件大小
+ *   vkey.GetVkeyServer        一次请求全部码率，从高到低取第一个有 purl 的
+ *
+ * 相对原实现的三点改进：
+ * 1. 不再依赖 c.y.qq.com（旧域名接口随时可能下线）
+ * 2. 请求带 comm.authst / loginUin，带 Cookie 时服务端才能识别 VIP 身份
+ * 3. 直链强制 https——上游 sip 只给 http，https 站点播放会被浏览器按混合内容拦截
+ */
+const TENCENT_QUALITY = [
+  ['size_flac', 999, 'F000', '.flac'],
+  ['size_320mp3', 320, 'M800', '.mp3'],
+  ['size_192aac', 192, 'C600', '.m4a'],
+  ['size_128mp3', 128, 'M500', '.mp3'],
+  ['size_96aac', 96, 'C400', '.m4a'],
+  ['size_48aac', 48, 'C200', '.m4a']
+]
+
+// media_mid 不会变，缓存详情省一次往返（旧实现每首都要查一次详情）
+const detailCache = new Map()
+const DETAIL_TTL = 60 * 60 * 1000
+const DETAIL_CACHE_MAX = 500
+
+const parseTencentCookie = (cookie = '') => {
+  const text = String(cookie || '')
+  const uin = text.match(/(?:^|;\s*)uin=o?(\d+)/)
+  const key = text.match(/(?:^|;\s*)(?:qqmusic_key|qm_keyst)=([^;]+)/)
+  return {
+    uin: uin ? uin[1] : '0',
+    authst: key ? key[1].trim() : ''
+  }
+}
+
+const tencentPost = async (payload) => {
+  const response = await fetch('https://u.y.qq.com/cgi-bin/musicu.fcg', {
+    method: 'POST',
+    headers: {
+      'User-Agent': TENCENT_UA,
+      Referer: 'https://y.qq.com/',
+      Origin: 'https://y.qq.com',
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  })
+  return response.json()
+}
+
+const getTencentDetail = async (songmid) => {
+  const cached = detailCache.get(songmid)
+  if (cached && Date.now() - cached.at < DETAIL_TTL) return cached.detail
+
+  const body = await tencentPost({
+    req_0: {
+      module: 'music.pf_song_detail_svr',
+      method: 'get_song_detail_yqq',
+      param: { song_mid: songmid }
+    },
+    comm: { format: 'json', ct: 19, cv: 0 }
+  })
+
+  const track = body?.req_0?.data?.track_info
+  if (!track) return null
+
+  const detail = { file: track.file || {}, type: track.type ?? 0 }
+  if (detailCache.size >= DETAIL_CACHE_MAX) detailCache.clear()
+  detailCache.set(songmid, { detail, at: Date.now() })
+  return detail
+}
+
+// sip 只给 http；ws.stream.qqmusic.qq.com 实测支持 https，避免混合内容拦截
+const pickSip = (sip = []) => {
+  for (const item of sip) {
+    if (typeof item === 'string' && item.startsWith('https://')) return item
+  }
+  return 'https://ws.stream.qqmusic.qq.com/'
+}
+
+const tencentUrl = async (songmid, { maxBr = 999, cookie = '' } = {}) => {
+  const detail = await getTencentDetail(songmid)
+  if (!detail) return JSON.stringify({ url: '', size: 0, br: -1 })
+
+  // 播放地址必须用 media_mid 构造 filename，它和 songmid 常常不同
+  const mediaMid = detail.file.media_mid || songmid
+  const tiers = TENCENT_QUALITY.filter(([key, br]) => detail.file[key] && br <= maxBr)
+  if (tiers.length === 0) return JSON.stringify({ url: '', size: 0, br: -1 })
+
+  const filenames = tiers.map(([, , prefix, ext]) => `${prefix}${mediaMid}${ext}`)
+  const { uin, authst } = parseTencentCookie(cookie)
+  const guid = String(Math.floor(Math.random() * 9e9) + 1e9)
+
+  const body = await tencentPost({
+    req_0: {
+      module: 'vkey.GetVkeyServer',
+      method: 'CgiGetVkey',
+      param: {
+        filename: filenames,
+        guid,
+        songmid: tiers.map(() => songmid),
+        songtype: tiers.map(() => detail.type),
+        uin,
+        loginflag: 1,
+        platform: '20'
+      }
+    },
+    loginUin: uin,
+    comm: { uin, format: 'json', ct: 19, cv: 0, authst }
+  })
+
+  const data = body?.req_0?.data
+  const list = data?.midurlinfo || []
+  const sip = data?.sip || []
+
+  // 按 filename 映射，避免上游返回顺序与请求顺序不一致时选错音质
+  const byName = new Map()
+  for (const item of list) {
+    if (item?.filename) byName.set(item.filename, item)
+  }
+
+  const base = pickSip(sip)
+  for (let i = 0; i < filenames.length; i++) {
+    const purl = String(byName.get(filenames[i])?.purl || '').trim()
+    if (!purl) continue
+    const url = purl.startsWith('http') ? purl : base + purl
+    const [sizeKey, br] = tiers[i]
+    return JSON.stringify({ url, size: detail.file[sizeKey] || 0, br })
+  }
+
+  return JSON.stringify({ url: '', size: 0, br: -1 })
+}
+
+/**
+ * 用新接口覆盖 url()；新接口异常时回退 @meting/core 原实现，
+ * 保证上游参数变化时不会整条链路不可用。
+ */
+const patchTencentUrl = (meting, cookie) => {
+  const fallback = meting.url.bind(meting)
+
+  // 默认 320，与 @meting/core 的 url(id, br=320) 保持一致；要 FLAC 显式传 999
+  meting.url = async (id, br = 320) => {
+    try {
+      const raw = await tencentUrl(String(id), { maxBr: br, cookie })
+      if (JSON.parse(raw)?.url) return raw
+    } catch (error) {
+      console.warn('[meting] 腾讯新 url 接口失败，回退原实现:', error?.message)
+    }
+
+    const legacy = await fallback(id, br)
+    // 原实现拼的是 http 直链，能拿到就顺手升级成 https
+    try {
+      const data = JSON.parse(legacy)
+      if (data?.url?.startsWith('http://')) {
+        data.url = data.url.replace(/^http:\/\//, 'https://')
+        return JSON.stringify(data)
+      }
+    } catch (error) {
+      // 保持原样
+    }
+    return legacy
+  }
+}
+
 export const createMeting = (server, cookie) => {
   const meting = new Meting(server)
   patchNeteaseEapiEncrypt(meting)
   meting.format(true)
   if (cookie) meting.cookie(cookie)
-  if (server === 'tencent') patchTencentSearch(meting)
+  if (server === 'tencent') {
+    patchTencentSearch(meting)
+    patchTencentUrl(meting, cookie)
+  }
   return meting
 }
