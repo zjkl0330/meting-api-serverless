@@ -10,9 +10,10 @@ compatibility_flags = ["nodejs_compat"]
 crons = ["0 */4 * * *"]
 
 # KV 存储：Dashboard → Bindings 绑定，变量名必须是 METING_KV
-# [[kv_namespaces]]
-# binding = "METING_KV"
-# id = "YOUR_KV_NAMESPACE_ID_HERE"
+# 已绑定：账号 zjkl 的 KV 命名空间（原 Cookie 池数据所在，37 个 UUID 键）
+[[kv_namespaces]]
+binding = "METING_KV"
+id = "6a07757750ee4229b72dad966ba95634"
 
 [vars]
 # 企业微信机器人 Webhook。公开仓库不要直接写在这里，推荐：
@@ -23,8 +24,10 @@ crons = ["0 */4 * * *"]
 # 主 Cookie 失效且没有备用时，是否临时降级匿名继续播放免费曲目（默认 1=开启）
 METING_ANONYMOUS_FALLBACK = "1"
 
-# 直链兜底平台（默认 netease；留空字符串即关闭跨平台兜底）
-METING_FALLBACK_SERVERS = "netease"
+# 直链兜底平台（留空字符串即关闭跨平台兜底）。
+# 逗号分隔，按顺序尝试。刻意覆盖多个平台：网易云/腾讯的接口在 CF 机房 IP 上
+# 会被风控（网易 code -462），而酷狗/酷我走的是各自独立的上游，不受牵连。
+METING_FALLBACK_SERVERS = "tencent,kugou,kuwo,netease"
 
 # 兜底是否必须歌手也匹配（1=严格，可能因找不到原唱而不兜底；0=优先匹配原唱，找不到时允许同名翻唱）
 METING_FALLBACK_STRICT_ARTIST = "0"

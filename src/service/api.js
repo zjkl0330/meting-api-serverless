@@ -83,7 +83,19 @@ export default async (c) => {
 
   if (data === undefined) {
     c.header('x-cache', 'miss')
-    data = await invoke(createMeting(server, resolved.cookie), METING_METHODS[type], id)
+    if (type === 'url') {
+      // 直链接口是风控重灾区（网易云 code -462、腾讯频控 2001），上游往往直接
+      // 抛错而不是返回空 url。若让异常冒泡，接口就是 500，跨平台兜底根本没机会
+      // 接手 —— 播放器彻底没声音。这里把异常转成「空直链」，让兜底逻辑继续走。
+      try {
+        data = await invoke(createMeting(server, resolved.cookie), 'url', id)
+      } catch (error) {
+        console.warn('[api] 直链上游异常，转入兜底:', error?.message)
+        data = { url: '' }
+      }
+    } else {
+      data = await invoke(createMeting(server, resolved.cookie), METING_METHODS[type], id)
+    }
 
     // 5.1 腾讯直链为空：可能是 Cookie 失效，立即体检并按需切换备用/匿名
     if (type === 'url' && !data?.url && server === 'tencent' && cookieAllowed) {
@@ -108,7 +120,9 @@ export default async (c) => {
     }
 
     // 5.2 仍然拿不到直链：临时跨平台兜底，保证音乐能继续播
-    if (type === 'url' && !data?.url && server === 'tencent') {
+    // 不限平台：网易云的 player/url 会被风控（code -462）导致直链稳定拿不到，
+    // 原来只在 tencent 上兜底，等于网易云一被拦就彻底哑火。
+    if (type === 'url' && !data?.url) {
       const fallback = await findUrlFallback(server, id, c.env)
       if (fallback) {
         data = { url: fallback.url, size: 0, br: -1 }

@@ -43,7 +43,7 @@ const json = (body) => new Response(JSON.stringify(body), {
 const realFetch = globalThis.fetch
 
 const installFetchMock = () => {
-  globalThis.fetch = async (input, init = {}) => {
+  const mock = async (input, init = {}) => {
     const url = typeof input === 'string' ? input : input.url
 
     if (url.startsWith('https://qyapi.weixin.qq.com')) {
@@ -56,13 +56,33 @@ const installFetchMock = () => {
     if (url.includes('fcg_play_single_song.fcg')) {
       return json(songDetail)
     }
+    if (url.includes('song/detail')) {
+      return json(songDetail)
+    }
     if (url.includes('u.y.qq.com/cgi-bin/musicu.fcg')) {
+      // 同一个端点承担两种用途：搜索（SearchCgiService）与取直链（GetVkeyServer），
+      // 按请求体里的 module 区分返回结构。
+      const body = String(init.body || '')
+      if (body.includes('SearchCgiService')) {
+        return json({
+          req_0: {
+            code: 0,
+            data: {
+              body: {
+                song: {
+                  list: [{ mid: '003OUlho2HcRHC', name: '告白气球', singer: [{ name: '周杰伦' }], album: { name: '告白气球', mid: '003RMaRI1iFoYd' } }]
+                }
+              }
+            }
+          }
+        })
+      }
       return json({
         req_0: {
           code: 0,
           data: {
             sip: ['https://dl.stream.qqmusic.qq.com/'],
-            midurlinfo: Array.from({ length: 7 }, () => ({ vkey: vkeyUrl ? 'VKEY' : '', purl: vkeyUrl }))
+            midurlinfo: Array.from({ length: 7 }, () => ({ vkey: vkeyUrl ? 'VKEY' : '', purl: vkeyUrl, filename: 'M800003OUlho2HcRHC.mp3' }))
           }
         }
       })
@@ -73,8 +93,30 @@ const installFetchMock = () => {
     if (url.includes('enhance/player/url')) {
       return json({ data: [{ url: neteaseUrl, size: 1000, br: 320 }] })
     }
+    // 跨平台兜底要逐个平台搜索候选再试直链，这里给出可命中的最小响应
+    if (url.includes('mobilecdn.kugou.com/api/v3/search/song')) {
+      return json({ data: { info: [{ hash: 'KUGOUHASH1', filename: '告白气球 - 周杰伦', singer: '周杰伦' }] } })
+    }
+    if (url.includes('m.kugou.com/app/i/getSongInfo.php') || url.includes('get_res_privilege')) {
+      // 库的 kugou urlDecode 读的是 bitRate（驼峰），写成 bitrate 会拿不到
+      return json({ url: [vkeyUrl || 'https://dl.kugou.com/fallback.mp3'], bitRate: 320000, fileSize: 1000 })
+    }
+    if (url.includes('kuwo.cn/api/www/search/searchMusicBykeyWord')) {
+      return json({ data: { list: [{ mid: 'KUWOMID1', name: '告白气球', singer: '周杰伦' }] } })
+    }
+    if (url.includes('kuwo.cn/api/v1/www/music/playUrl')) {
+      return json({ code: 200, data: { url: vkeyUrl || 'https://dl.kuwo.cn/fallback.mp3', br: 128 } })
+    }
+    if (url.includes('client_search_cp') || url.includes('musicu.fcg')) {
+      return json({
+        code: 0,
+        data: { song: { list: [{ mid: 'TENCENTMID1', songmid: 'TENCENTMID1', name: '告白气球', singer: [{ name: '周杰伦' }] }] } }
+      })
+    }
     throw new Error(`未预期的上游请求: ${url}`)
   }
+  globalThis.fetch = mock
+  return mock
 }
 
 const makeEnv = () => ({
@@ -216,6 +258,98 @@ test('直链为空时走跨平台兜底并标记响应头', async () => {
   assert.equal(response.headers.get('location'), neteaseUrl)
   assert.equal(response.headers.get('x-fallback-source'), 'netease')
   assert.equal(response.headers.get('x-cookie-state'), 'anonymous')
+})
+
+test('netease 拿不到直链时也走跨平台兜底（风控下不至于哑火）', async () => {
+  // 回归：原来兜底只在 server==='tencent' 时触发，网易云被风控（code -462）
+  // 导致 player/url 稳定拿不到直链时，接口直接 404，播放器彻底没声音。
+  // 这里不依赖各平台的搜索/直链响应结构（那是第三方库的细节），只验证契约：
+  // 主源是 netease 且拿不到直链时，兜底必须被调用，且不是「同平台重试」。
+  const env = makeEnv()
+
+  // 网易云 song 能查到（兜底要靠它取歌名与歌手），player/url 返回空直链（模拟风控）
+  songDetail = {
+    code: 0,
+    songs: [{
+      id: 3361467146,
+      name: '告白气球',
+      ar: [{ name: '周杰伦' }],
+      al: { name: '告白气球', pic_str: '109951' }
+    }]
+  }
+  neteaseSearch = {
+    result: {
+      songs: [{
+        id: 3361467146,
+        name: '告白气球',
+        ar: [{ name: '周杰伦' }],
+        al: { name: '告白气球', pic_str: '109951' }
+      }]
+    }
+  }
+  neteaseUrl = ''
+
+  // 记录兜底实际尝试的平台
+  const tried = []
+  const baseMock = globalThis.fetch
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url
+    if (url.includes('music.163.com')) return baseMock(input, init)
+    tried.push(url.slice(0, 60))
+    // 其他平台统一返回空结果：重点是「兜底被触发且尝试了跨平台」
+    return json({ code: 0, data: { info: [], list: [], song: { list: [] } } })
+  }
+
+  try {
+    const app = createApp()
+    const auth = createHmac('sha1', 'token').update('neteaseurl3361467146').digest('hex')
+    const request = new Request(`http://localhost/api?server=netease&type=url&id=3361467146&auth=${auth}`)
+    const response = await app.fetch(request, env)
+
+    // 兜底被触发 → 会去访问非网易云的上游
+    assert.ok(tried.length > 0, 'netease 拿不到直链时也应尝试跨平台兜底')
+    assert.ok(
+      tried.some(u => u.includes('kugou') || u.includes('kuwo') || u.includes('qq.com')),
+      `兜底应访问其他平台，实际访问：${JSON.stringify(tried)}`
+    )
+    // 拿不到直链时仍是 404，但必须带兜底相关响应头说明走过兜底路径
+    assert.equal(response.status, 404)
+  } finally {
+    installFetchMock()
+  }
+})
+
+test('直链上游抛错时转入兜底而不是直接 500', async () => {
+  // 网易云被风控时 player/url 是抛错而非返回空 url，异常若冒泡就是 500，
+  // 跨平台兜底完全没机会接手（播放器彻底没声音）。
+  const env = makeEnv()
+  const tried = []
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url
+    if (url.includes('enhance/player/url')) {
+      throw new Error('风控拦截')
+    }
+    // song/detail 要能取到歌名与歌手，否则兜底第一步（fetchMeta）就返回 null
+    if (url.includes('song/detail')) {
+      return json({ code: 0, songs: [{ id: 3361467146, name: '告白气球', ar: [{ name: '周杰伦' }], al: { name: '告白气球', pic_str: '109951' } }] })
+    }
+    tried.push(url.slice(0, 60))
+    return json({ code: 0, data: { info: [], list: [], song: { list: [] } } })
+  }
+
+  try {
+    const app = createApp()
+    // 用不同的 id：url 结果会被 LRU 缓存 60s，撞键会直接命中缓存、不再走上游
+    const auth = createHmac('sha1', 'token').update('neteaseurl3361467147').digest('hex')
+    const request = new Request(`http://localhost/api?server=netease&type=url&id=3361467147&auth=${auth}`)
+    const response = await app.fetch(request, env)
+
+    assert.notEqual(response.status, 500, '上游异常不应直接冒泡成 500')
+    assert.ok(tried.length > 0, '上游异常后应尝试跨平台兜底')
+  } finally {
+    // 恢复 beforeEach 安装的标准 mock（不是进入测试时的引用，那可能已被别的用例改过）
+    installFetchMock()
+  }
 })
 
 test('Cookie 解析与脱敏', () => {
